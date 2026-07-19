@@ -1,0 +1,6 @@
+{
+  "is_classifier": true,
+  "threshold_lux": 250,
+  "geometry": "shrunk_bbox_0.65",
+  "slim": true
+}

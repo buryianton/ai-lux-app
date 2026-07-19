@@ -1,0 +1,13 @@
+{
+  "type": "multi_regressor",
+  "targets": [
+    "lux_C",
+    "lux_UL",
+    "lux_UR",
+    "lux_LR",
+    "lux_LL"
+  ],
+  "is_log_space": false,
+  "subset": "white_paper",
+  "n_features": 110
+}

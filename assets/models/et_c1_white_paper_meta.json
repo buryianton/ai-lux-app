@@ -1,0 +1,6 @@
+{
+  "type": "regressor",
+  "is_log_space": false,
+  "geometry": "central_only",
+  "slim": true
+}

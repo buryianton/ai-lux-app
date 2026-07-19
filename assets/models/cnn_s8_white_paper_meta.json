@@ -1,0 +1,13 @@
+{
+  "type": "cnn_regressor",
+  "is_log_space": true,
+  "subset": "white_paper",
+  "input": "input_image",
+  "input_shape": [
+    1,
+    160,
+    128,
+    1
+  ],
+  "geometry": "shrunk_bbox_0.65"
+}
