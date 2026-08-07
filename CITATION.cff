@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this app in research, please cite the article below."
+title: "AI Lux — smartphone illuminance estimation (research build)"
+authors:
+  - family-names: Buryi
+    given-names: Anton
+repository-code: "https://github.com/buryianton/ai-lux-app"
+keywords:
+  - illuminance
+  - lux
+  - occupational health
+  - workplace lighting
+  - smartphone
+  - machine learning
+license: MIT
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Buryi
+      given-names: Anton
+  title: "A Smartphone Image Dataset with Lux-Meter Ground Truth for Workplace Illuminance Estimation"
+  journal: "Data in Brief"
+  year: 2026
+  pages: "113134"
+  doi: "10.1016/j.dib.2026.113134"
