@@ -1,11 +1,17 @@
 # AI Lux — smartphone illuminance estimation (research build)
 
+> The models deployed in this app are described in:
+> Buryi, A. (2026). **A Smartphone Image Dataset with Lux-Meter Ground Truth for
+> Workplace Illuminance Estimation.** *Data in Brief*, 113134.
+> https://doi.org/10.1016/j.dib.2026.113134
+
 AI Lux is an Android research app that estimates surface illuminance
 (lux) from smartphone photographs using machine-learning models trained
 on a controlled open dataset. The primary protocol evaluated to date uses
 a white paper sheet placed on the surface as a standardized target.
-Models for bare table surfaces are also included, but have not yet been
-field-tested.
+Models for bare table surfaces are also included; they have received only 
+limited pilot field testing (two wood-textured tables) and require broader 
+validation across surface types.
 
 This tool addresses a practical need in occupational hygiene: rapid
 preliminary screening of workplace illumination when follow-up measurement
@@ -108,11 +114,12 @@ dataset, and their training scripts will be added to that repository.
 ## Research context
 
 - Dataset (5,814 labeled photographs):
-  [doi.org/10.5281/zenodo.20657011](https://doi.org/10.5281/zenodo.20657011)
+  [doi.org/10.5281/zenodo.20499311](https://doi.org/10.5281/zenodo.20499311)
 - Dataset & experiment code:
   [ai-lux-estimation](https://github.com/buryianton/ai-lux-estimation)
-- A *Data in Brief* article describing the dataset is under review; a
-  validation article is in preparation.
+- Data article (published): Buryi, A. (2026). *Data in Brief*, 113134.
+  [doi.org/10.1016/j.dib.2026.113134](https://doi.org/10.1016/j.dib.2026.113134)
+- A validation article on the on-device deployment is in preparation.
 
 ## Intended use and limitations
 AI Lux is intended for research, education, and preliminary screening of
