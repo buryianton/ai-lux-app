@@ -7,6 +7,7 @@ import 'dart:async';
 import 'dart:math';
 
 import '../services/inference_service.dart';
+import '../services/photo_saver.dart';
 import 'calibration_screen.dart';
 import 'log_viewer_screen.dart';
 import 'results_screen.dart';
@@ -54,7 +55,54 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   String _selectedModel = 'fast'; // 'fast', 'all', or a model name
   final _picker = ImagePicker();
 
-  bool get _isLocked => _pitchDeg >= 42 && _pitchDeg <= 48;
+  // Camera height selector: drives BOTH the A4 on-screen guide and the
+  // height-adaptive feature extraction (constant-physical-footprint s8
+  // sampling). 0 = default/off -> extraction assumes the reference 31 cm.
+  // Static so the selected height survives camera-screen rebuilds (the
+  // chip silently resetting to default was a mislabel hazard in sessions).
+  static int _persistedGuideCm = 0;
+  int get _guideCm => _persistedGuideCm;
+  set _guideCm(int v) => _persistedGuideCm = v;
+  static const _guideOptions = [0, 22, 31, 40, 47, 53, 56];
+
+  double get _heightCm => _guideCm > 0 ? _guideCm.toDouble() : 31.0;
+
+  // Flat-field position mode: 9 tappable markers; the selected one names
+  // where the metered point sits in the frame and is stamped into the
+  // saved filename (__POS token). For the vignetting-map sessions.
+  // 0 = off, 1 = FRAME (markers fixed on screen — vignetting sessions),
+  // 2 = WORLD (marker offsets scale by 31/height so each marker tracks the
+  // SAME physical point on the table at any height — multi-point sessions).
+  int _posModeKind = 0;
+  bool get _posMode => _posModeKind > 0;
+  bool get _posWorld => _posModeKind == 2;
+  String? _posSel;
+  static const Map<String, Offset> _posMarkers = {
+    'nw': Offset(0.18, 0.16),
+    'n': Offset(0.50, 0.16),
+    'ne': Offset(0.82, 0.16),
+    'w': Offset(0.14, 0.50),
+    'c': Offset(0.50, 0.50),
+    'e': Offset(0.86, 0.50),
+    'sw': Offset(0.18, 0.84),
+    's': Offset(0.50, 0.84),
+    'se': Offset(0.82, 0.84),
+    // mid ring: half offsets (~22 cm from center at 31 cm height per the
+    // 2026-09-29 ruler session) — comfortable on small tables, and inside
+    // the zone where the 31/h world-tracking is sub-percent accurate.
+    'mn': Offset(0.50, 0.33),
+    'me': Offset(0.68, 0.50),
+    'ms': Offset(0.50, 0.67),
+    'mw': Offset(0.32, 0.50),
+  };
+
+  // Angle-free mode: unlocks capture at any tilt (for tilt-sweep
+  // sessions); the measured angle is stamped into saved filenames.
+  bool _angleFree = false;
+
+  bool get _isLocked => _angleFree
+      ? (_pitchDeg >= 5 && _pitchDeg <= 85)
+      : (_pitchDeg >= 42 && _pitchDeg <= 48);
 
   bool _permissionDenied = false;
 
@@ -122,9 +170,12 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     });
   }
 
+  double? _pitchAtCapture;
+
   Future<void> _capture() async {
     if (!_cameraReady || _state != CaptureState.locked) return;
     setState(() => _state = CaptureState.capturing);
+    _pitchAtCapture = _pitchDeg;
 
     try {
       final imagePath = await _channel.invokeMethod<String>('capture');
@@ -141,6 +192,81 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     }
   }
 
+  /// Flash-pair pilot capture: two stills seconds apart at the same locked
+  /// exposure, torch off then torch on. The pixel difference isolates the
+  /// torch's contribution = per-pixel reflectance map (flash/no-flash
+  /// separation). Photos go straight to dataset_photos with FP{pair}t0/t1
+  /// tokens; no inference, no results screen.
+  Future<void> _captureFlashPair() async {
+    if (!_cameraReady || _state != CaptureState.locked) {
+      // Never swallow the tap silently - that lost a whole session's pairs.
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          content: Text('Flash pair needs the tilt locked (green) first'),
+          backgroundColor: Colors.orange));
+      return;
+    }
+    final luxText = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Flash pair'),
+        content: TextField(
+          controller: luxText,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(
+              labelText: 'Meter lux at center (optional)'),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Capture pair')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final luxC = double.tryParse(luxText.text.trim());
+    setState(() => _state = CaptureState.capturing);
+    final pairId = (DateTime.now().millisecondsSinceEpoch % 1000000)
+        .toString().padLeft(6, '0');
+    try {
+      final pathA = await _channel.invokeMethod<String>('capture');
+      await _channel.invokeMethod('setTorch', {'on': true});
+      // Let the torch output and the repeating request settle.
+      await Future.delayed(const Duration(milliseconds: 1200));
+      final pathB = await _channel.invokeMethod<String>('capture');
+      await _channel.invokeMethod('setTorch', {'on': false});
+      for (final e in [(pathA, 't0'), (pathB, 't1')]) {
+        if (e.$1 == null) continue;
+        await PhotoSaver.save(
+          imagePath: e.$1!,
+          source: 'capture',
+          luxC: luxC,
+          heightCm: _heightCm,
+          note: 'flash pair $pairId ${e.$2 == 't0' ? 'torch off' : 'torch on'}',
+          extraTag: 'FP$pairId${e.$2}',
+        );
+      }
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('Flash pair FP$pairId saved to dataset photos'),
+          backgroundColor: const Color(0xFF1D9E75),
+        ));
+      }
+    } on PlatformException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content: Text('Flash pair failed: ${e.message}'),
+            backgroundColor: Colors.red));
+      }
+    } finally {
+      // Never leave the torch on, whatever happened above.
+      try { await _channel.invokeMethod('setTorch', {'on': false}); }
+      catch (_) {}
+      if (mounted) setState(() => _state = CaptureState.locked);
+    }
+  }
+
   Future<void> _runInference(String imagePath, {required String source}) async {
     setState(() => _isRunningInference = true);
     try {
@@ -152,6 +278,10 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         onlyModel: (suite != null || _selectedModel == 'all')
             ? null
             : _selectedModel,
+        heightCm: _heightCm,
+        // Native captures go through the Camera2 pipeline and need the
+        // stock-domain LUT; uploads are already stock JPEGs.
+        pipelineLut: source == 'capture',
       );
       if (!mounted) return;
       await Navigator.of(context).push(MaterialPageRoute(
@@ -159,6 +289,13 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           imagePath: imagePath,
           source: source,
           run: run,
+          heightCm: _heightCm,
+          posLabel: !_posMode || _posSel == null
+              ? null
+              : (_posWorld ? 'w$_posSel' : _posSel),
+          angleDeg: _angleFree && source == 'capture'
+              ? _pitchAtCapture
+              : null,
         ),
       ));
       // Returning from results (or from the picker) may have paused the
@@ -328,8 +465,181 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
           if (_cameraReady)
             Positioned.fill(
               child: GeometryOverlay(
-                  state: _state, pitchDeg: _pitchDeg, geomMode: _geomMode),
+                  state: _state,
+                  pitchDeg: _pitchDeg,
+                  geomMode: _geomMode,
+                  guideCm: _guideCm),
             ),
+
+          // ── A4 height-guide toggle chip ─────────────────────────────────
+          if (_cameraReady)
+            Positioned(
+              top: 96,
+              left: 16,
+              child: GestureDetector(
+                onTap: () => setState(() {
+                  final i = _guideOptions.indexOf(_guideCm);
+                  _guideCm =
+                      _guideOptions[(i + 1) % _guideOptions.length];
+                }),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                        color: _guideCm > 0
+                            ? Colors.amber
+                            : Colors.white24,
+                        width: 1),
+                  ),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(Icons.height,
+                        size: 14,
+                        color:
+                            _guideCm > 0 ? Colors.amber : Colors.white54),
+                    const SizedBox(width: 5),
+                    Text(
+                      _guideCm > 0
+                          ? 'Height $_guideCm cm'
+                          : 'Height 31 cm (default)',
+                      style: TextStyle(
+                          color: _guideCm > 0
+                              ? Colors.amber
+                              : Colors.white54,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w500),
+                    ),
+                  ]),
+                ),
+              ),
+            ),
+
+          // ── Flat-field position-mode chip + markers ─────────────────────
+          if (_cameraReady)
+            Positioned(
+              top: 140,
+              left: 16,
+              child: GestureDetector(
+                onTap: () => setState(() {
+                  _posModeKind = (_posModeKind + 1) % 3;
+                  if (!_posMode) _posSel = null;
+                }),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                        color: _posMode
+                            ? Colors.cyanAccent
+                            : Colors.white24,
+                        width: 1),
+                  ),
+                  child: Text(
+                    !_posMode
+                        ? 'POS mode off'
+                        : '${_posWorld ? "POS WORLD" : "POS FRAME"}: '
+                            '${_posSel?.toUpperCase() ?? "tap a marker"}',
+                    style: TextStyle(
+                        color: _posMode
+                            ? Colors.cyanAccent
+                            : Colors.white54,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500),
+                  ),
+                ),
+              ),
+            ),
+          // ── Angle-free toggle chip ──────────────────────────────────────
+          if (_cameraReady)
+            Positioned(
+              top: 184,
+              left: 16,
+              child: GestureDetector(
+                onTap: () => setState(() => _angleFree = !_angleFree),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 10, vertical: 6),
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                        color: _angleFree
+                            ? Colors.orangeAccent
+                            : Colors.white24,
+                        width: 1),
+                  ),
+                  child: Text(
+                    _angleFree
+                        ? 'Angle FREE (logged)'
+                        : 'Angle lock 45°',
+                    style: TextStyle(
+                        color: _angleFree
+                            ? Colors.orangeAccent
+                            : Colors.white54,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w500),
+                  ),
+                ),
+              ),
+            ),
+          if (_cameraReady && _posMode)
+            ..._posMarkers.entries.map((e) {
+              final size = MediaQuery.of(context).size;
+              final sel = _posSel == e.key;
+              // WORLD mode: scale marker offsets from center by 31/height so
+              // each marker tracks the same physical table point (same rule
+              // as the constant-footprint analysis box). Ruler-calibrated
+              // 2026-09-29: sub-percent at the mid ring; the FAR NORTH row
+              // compresses ~8% less than 31/h at h>=40 (tilt perspective),
+              // so its y-offset gets the measured correction. Other outer
+              // rows await calibration (A4 homography will supersede).
+              final wf = _posWorld ? 31.0 / _heightCm : 1.0;
+              var ox = (e.value.dx - 0.5) * wf;
+              var oy = (e.value.dy - 0.5) * wf;
+              if (_posWorld && e.value.dy < 0.3) {
+                final h = _heightCm;
+                final corr = h <= 31
+                    ? 1.0
+                    : (h >= 40 ? 1.08 : 1.0 + 0.08 * (h - 31) / 9.0);
+                oy *= corr;
+              }
+              final mx = 0.5 + ox;
+              final my = 0.5 + oy;
+              return Positioned(
+                left: mx * size.width - 22,
+                top: my * size.height - 22,
+                child: GestureDetector(
+                  onTap: () => setState(() => _posSel = e.key),
+                  child: Container(
+                    width: 44,
+                    height: 44,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: sel
+                          ? Colors.cyanAccent.withValues(alpha: 0.25)
+                          : Colors.black38,
+                      border: Border.all(
+                          color: sel
+                              ? Colors.cyanAccent
+                              : Colors.white38,
+                          width: sel ? 2 : 1),
+                    ),
+                    child: Text(e.key.toUpperCase(),
+                        style: TextStyle(
+                            color: sel
+                                ? Colors.cyanAccent
+                                : Colors.white70,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600)),
+                  ),
+                ),
+              );
+            }),
 
           // ── Model picker (single model or all) ─────────────────────────
           if (_cameraReady)
@@ -392,12 +702,20 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          IconButton(
-            onPressed: _isRunningInference ? null : _pickAndAnalyze,
-            icon: const Icon(Icons.photo_library_outlined,
-                color: Colors.white70, size: 28),
-            tooltip: 'Analyze photo from gallery',
-          ),
+          Row(mainAxisSize: MainAxisSize.min, children: [
+            IconButton(
+              onPressed: _isRunningInference ? null : _pickAndAnalyze,
+              icon: const Icon(Icons.photo_library_outlined,
+                  color: Colors.white70, size: 28),
+              tooltip: 'Analyze photo from gallery',
+            ),
+            IconButton(
+              onPressed: _isRunningInference ? null : _captureFlashPair,
+              icon: const Icon(Icons.flash_on_outlined,
+                  color: Colors.amberAccent, size: 26),
+              tooltip: 'Flash pair (torch off/on, saved to dataset)',
+            ),
+          ]),
           GestureDetector(
             onTap: _isRunningInference ? null : _capture,
             child: Container(
@@ -488,11 +806,34 @@ class GeometryOverlay extends StatelessWidget {
   /// center marker only · 'center' = center marker only.
   final String geomMode;
 
+  /// A4 height guide: 0 = off, else target camera height in cm.
+  final int guideCm;
+
   const GeometryOverlay(
       {super.key,
       required this.state,
       required this.pitchDeg,
-      this.geomMode = 'full'});
+      this.geomMode = 'full',
+      this.guideCm = 0});
+
+  /// Where an A4 sheet (portrait, centered on the C point) should appear
+  /// at 45° tilt and 31 cm, as screen fractions: (centerY, bottomWidth,
+  /// topWidth, height). BETA estimate derived from dataset geometry — to
+  /// be CALIBRATED from the session-3 photos (paper + orange-tape quad at
+  /// five ruler-verified heights).
+  static const List<double> _paperGuide31 = [0.497, 0.55, 0.33, 0.33];
+
+  /// Guide trapezoid for an arbitrary height: extents scale ~31/h
+  /// (first-order; keystone change with height is ignored in this beta).
+  static List<double> _paperGuideFor(int cm) {
+    final r = 31.0 / cm;
+    return [
+      _paperGuide31[0],
+      _paperGuide31[1] * r,
+      _paperGuide31[2] * r,
+      _paperGuide31[3] * r,
+    ];
+  }
 
   static const Map<String, Offset> _roiFractions = {
     'C':  Offset(0.495, 0.497),
@@ -528,10 +869,15 @@ class GeometryOverlay extends StatelessWidget {
     var frameW = size.width * 0.375;
     var frameH = size.height * 0.362;
     if (geomMode == 'small') {
-      frameL += frameW * (1 - shrink) / 2;
-      frameT += frameH * (1 - shrink) / 2;
-      frameW *= shrink;
-      frameH *= shrink;
+      // Height-adaptive: the s8 extraction shrinks its box by 31/height
+      // (constant physical footprint), so the DISPLAYED box must match —
+      // what you see is what the model reads.
+      final hf = guideCm > 0 ? 31.0 / guideCm : 1.0;
+      final f = shrink * hf;
+      frameL += frameW * (1 - f) / 2;
+      frameT += frameH * (1 - f) / 2;
+      frameW *= f;
+      frameH *= f;
     }
     final showFrame = geomMode != 'center';
     final label = switch (geomMode) {
@@ -553,6 +899,29 @@ class GeometryOverlay extends StatelessWidget {
           ),
         ),
       if (showFrame) ..._buildCorners(frameL, frameT, frameW, frameH),
+      // ── A4 height guide (dashed amber trapezoid + label) ──────────────
+      if (guideCm > 0) ...[
+        Positioned.fill(
+          child: CustomPaint(
+            painter: _PaperGuidePainter(
+                params: _paperGuideFor(guideCm),
+                color: Colors.amber.withValues(alpha: 0.9)),
+          ),
+        ),
+        Positioned(
+          left: size.width * 0.25,
+          top: size.height *
+                  (_paperGuideFor(guideCm)[0] +
+                      _paperGuideFor(guideCm)[3] / 2) +
+              8,
+          width: size.width * 0.5,
+          child: Text(
+            'A4 guide · $guideCm cm (beta) — match the sheet edges',
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: Colors.amber, fontSize: 10),
+          ),
+        ),
+      ],
       Positioned(
         left: size.width * 0.25,
         top: size.height * 0.321 + size.height * 0.362 + 6,
@@ -659,6 +1028,45 @@ class _AngleIndicator extends StatelessWidget {
       ]),
     );
   }
+}
+
+/// Dashed trapezoid showing where the A4 sheet's edges should appear at
+/// the target height (45° tilt keystones the far edge narrower).
+class _PaperGuidePainter extends CustomPainter {
+  final List<double> params; // [centerY, bottomWidth, topWidth, height]
+  final Color color;
+  const _PaperGuidePainter({required this.params, required this.color});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final cy = params[0] * size.height;
+    final bw = params[1] * size.width;
+    final tw = params[2] * size.width;
+    final h = params[3] * size.height;
+    final cx = size.width / 2;
+    final path = Path()
+      ..moveTo(cx - tw / 2, cy - h / 2)
+      ..lineTo(cx + tw / 2, cy - h / 2)
+      ..lineTo(cx + bw / 2, cy + h / 2)
+      ..lineTo(cx - bw / 2, cy + h / 2)
+      ..close();
+    final p = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.6;
+    for (final metric in path.computeMetrics()) {
+      var d = 0.0;
+      const dash = 8.0, gap = 5.0;
+      while (d < metric.length) {
+        canvas.drawPath(metric.extractPath(d, d + dash), p);
+        d += dash + gap;
+      }
+    }
+  }
+
+  @override
+  bool shouldRepaint(_PaperGuidePainter o) =>
+      o.params != params || o.color != color;
 }
 
 class _CornerPainter extends CustomPainter {

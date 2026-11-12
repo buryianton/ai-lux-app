@@ -39,6 +39,7 @@ dependencies:
   image: ^4.9.1
   image_picker: ^1.2.3
   share_plus: ^13.2.0
+  archive: ^4.0.9
 
 
 

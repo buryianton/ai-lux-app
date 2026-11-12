@@ -476,15 +476,92 @@ class InferenceService {
   /// writes <name>_features.json next to each processed image.
   static bool enableParityDump = false;
 
+  // ── Pipeline correction: Camera2-JPEG -> stock-JPEG (dataset) domain ──
+  // The two pipelines differ by CHANNEL MIXING (Samsung stock applies a
+  // scene-adaptive color matrix), so a 1-D luma LUT is CCT-dependent and
+  // was replaced (2026-09-23) by a two-band affine 3x3 color transform
+  // fitted on 111 paired captures at 2700/5000/6500 K (median luma
+  // residual 2.7%, CCT-independent — and being linear, it is also correct
+  // under MIXED illuminants). Bands split at luma ~96 with a smooth blend
+  // so gradient features see no seam. Native captures only — uploads are
+  // already stock JPEGs.
+  static bool pipelineLutEnabled = true;
+  static bool _lutActive = false; // set per-extraction (isolate-local)
+
+  // app [r,g,b,1] -> stock [r,g,b]; column-major per output channel.
+  // v2 (2026-09-24): refit on 167 pairs across TWO physical lamps,
+  // 2700/4000/5000/6500 K and two mixed-illuminant setups; median pixel
+  // residual 2.64%, all lamp groups within +-3.3%. Leave-one-lamp-out
+  // showed an unseen lamp costs ~-6% dark — so per-device fits should
+  // always include at least two different lamps.
+  static const List<List<double>> _mLow = [
+    [1.60738, -0.10180, -0.61545, 6.40637], // stock R coeffs
+    [-0.38929, 1.44052, -0.25916, -0.32679], // stock G
+    [-0.70604, 0.25279, 1.95878, 12.45643], // stock B
+  ];
+  static const List<List<double>> _mHigh = [
+    [1.50713, -0.17004, -0.40227, -7.59821],
+    [-0.19337, 1.12709, -0.00495, -20.25705],
+    [-0.59383, -0.00791, 1.65860, 34.75984],
+  ];
+
+  // Residual tone curve (applied AFTER the color matrix, to the Fast
+  // primary regressor's output on the capture path). Fitted 2026-09-30 on
+  // 25 centered captures across 2700-6500 K: removes the S-shaped
+  // luma-dependent residual the two coarse matrix bands cannot bend
+  // around (-10..-14% dark, +8..+17% around 450-560 lx; MAPE 7.4% -> 2.8%,
+  // one curve for all CCTs).
+  static const List<double> _toneX = [70, 293, 455, 582, 663];
+  static const List<double> _toneY = [0.8877, 0.9404, 1.0538, 1.1028, 1.0120];
+
+  static double _toneCorrect(double lux) {
+    double r;
+    if (lux <= _toneX.first) {
+      r = _toneY.first;
+    } else if (lux >= _toneX.last) {
+      r = _toneY.last;
+    } else {
+      r = _toneY.last;
+      for (var i = 1; i < _toneX.length; i++) {
+        if (lux <= _toneX[i]) {
+          final t = (lux - _toneX[i - 1]) / (_toneX[i] - _toneX[i - 1]);
+          r = _toneY[i - 1] + t * (_toneY[i] - _toneY[i - 1]);
+          break;
+        }
+      }
+    }
+    return lux / r;
+  }
+
+  /// Applies the two-band pipeline color correction to one pixel.
+  /// Returns [r, g, b] in the stock/dataset domain, clamped to 0..255.
+  static List<double> _pipeCorrect(double r, double g, double b) {
+    final luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    // blend weight: 0 = low matrix (luma<=80), 1 = high (luma>=112)
+    final w = ((luma - 80.0) / 32.0).clamp(0.0, 1.0);
+    final out = List<double>.filled(3, 0);
+    for (var c = 0; c < 3; c++) {
+      final lo = _mLow[c][0] * r + _mLow[c][1] * g +
+          _mLow[c][2] * b + _mLow[c][3];
+      final hi = _mHigh[c][0] * r + _mHigh[c][1] * g +
+          _mHigh[c][2] * b + _mHigh[c][3];
+      out[c] = ((1 - w) * lo + w * hi).clamp(0.0, 255.0);
+    }
+    return out;
+  }
+
   /// Full pipeline: read JPEG -> EXIF transpose -> extract ROI features
   /// -> run inference with the given model -> return result.
   static Future<InferenceResult> runInference({
     required String imagePath,
     required String modelName,
+    double heightCm = 31.0,
+    bool pipelineLut = false,
   }) async {
     // Heavy image work (decode + features) runs in a background isolate
     // so the UI thread never blocks long enough to trigger an ANR.
-    final extracted = await Isolate.run(() => extractFeatures(imagePath));
+    final extracted = await Isolate.run(() => extractFeatures(imagePath,
+        heightCm: heightCm, pipelineLut: pipelineLut));
     return runOnFeatures(
         modelName: modelName,
         featureMap: extracted.featureMap,
@@ -495,9 +572,13 @@ class InferenceService {
   /// By default runs EVERY model in [availableModels]; pass [onlyModel]
   /// to run just one. Returns modelName -> result.
   static Future<AllModelsRun> runAllModels(String imagePath,
-      {String? onlyModel, List<String>? models}) async {
+      {String? onlyModel,
+      List<String>? models,
+      double heightCm = 31.0,
+      bool pipelineLut = false}) async {
     // Heavy image work in a background isolate (ANR guard).
-    final extracted = await Isolate.run(() => extractFeatures(imagePath));
+    final extracted = await Isolate.run(() => extractFeatures(imagePath,
+        heightCm: heightCm, pipelineLut: pipelineLut));
     final selected = models != null
         ? allModels.where((m) => models.contains(m.name)).toList()
         : onlyModel == null
@@ -519,11 +600,28 @@ class InferenceService {
         print('Model ${m.name} failed: $e');
       }
     }
+    // Residual tone curve on the Fast primary (capture path only).
+    if (pipelineLut && pipelineLutEnabled) {
+      final r = results['et_s8_white_paper'];
+      if (r?.luxEstimate != null) {
+        results['et_s8_white_paper'] =
+            InferenceResult(luxEstimate: _toneCorrect(r!.luxEstimate!));
+      }
+    }
     return AllModelsRun(extracted: extracted, results: results);
   }
 
   /// Steps 1-5: decode, EXIF-correct, extract the full named feature map.
-  static Future<ExtractedFeatures> extractFeatures(String imagePath) async {
+  ///
+  /// [heightCm]: camera height above the surface. The shrunken (s8)
+  /// context box is scaled by 31/height so it keeps a CONSTANT PHYSICAL
+  /// footprint on the paper at any height, then resized back to the
+  /// reference pixel size so texture/gradient features keep the training
+  /// pixel scale. Validated on frozen-lamp sweeps (2026-09-22): raw bias
+  /// flat within ~1.5 pp across 31-56 cm (vs -9.7% drift when fixed).
+  static Future<ExtractedFeatures> extractFeatures(String imagePath,
+      {double heightCm = 31.0, bool pipelineLut = false}) async {
+    _lutActive = pipelineLut && pipelineLutEnabled;
     // ── 1. Load + EXIF-transpose the image ────────────────────────────
     final bytes = await File(imagePath).readAsBytes();
     img.Image? decoded = img.decodeImage(bytes);
@@ -591,13 +689,19 @@ class InferenceService {
     final scy = (cornerBox.top + cornerBox.bottom) / 2;
     final shw = (cornerBox.right - cornerBox.left) / 2 * shrink;
     final shh = (cornerBox.bottom - cornerBox.top) / 2 * shrink;
-    final shrunkPatch = _cropBbox(
+    // Height-adaptive sampling: constant physical footprint (see docstring).
+    final hf = 31.0 / heightCm;
+    final shrunkRaw = _cropBbox(
       image,
-      (scx - shw).round(),
-      (scy - shh).round(),
-      (scx + shw).round(),
-      (scy + shh).round(),
+      (scx - shw * hf).round(),
+      (scy - shh * hf).round(),
+      (scx + shw * hf).round(),
+      (scy + shh * hf).round(),
     );
+    final shrunkPatch = (hf - 1.0).abs() < 1e-6
+        ? shrunkRaw
+        : img.copyResize(shrunkRaw,
+            width: (2 * shw).round(), height: (2 * shh).round());
     final shrunkBasic = _computeBasicFeatures(shrunkPatch);
     final gridShrunk = _computeGridFeatures(shrunkPatch, gridN: 8, prefix: 'sqs8');
     gridShrunk['sqs8_mean_luma'] = shrunkBasic.meanLuma;
@@ -613,8 +717,14 @@ class InferenceService {
     for (var yy = 0; yy < 160; yy++) {
       for (var xx = 0; xx < 128; xx++) {
         final px = cnnResized.getPixel(xx, yy);
-        cnnInput[ci++] =
-            (0.2126 * px.r + 0.7152 * px.g + 0.0722 * px.b) / 255.0;
+        var r = px.r.toDouble(), g = px.g.toDouble(), b = px.b.toDouble();
+        if (_lutActive) {
+          final c = _pipeCorrect(r, g, b);
+          r = c[0];
+          g = c[1];
+          b = c[2];
+        }
+        cnnInput[ci++] = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
       }
     }
 
@@ -850,15 +960,22 @@ class InferenceService {
     for (var y = 0; y < h; y++) {
       for (var x = 0; x < w; x++) {
         final p = patch.getPixel(x, y);
-        final r = p.r.toDouble();
-        final g = p.g.toDouble();
-        final b = p.b.toDouble();
+        var r = p.r.toDouble();
+        var g = p.g.toDouble();
+        var b = p.b.toDouble();
+        // Pipeline correction: map native-capture pixels into the
+        // stock/dataset color domain before any feature is computed.
+        if (_lutActive) {
+          final c = _pipeCorrect(r, g, b);
+          r = c[0];
+          g = c[1];
+          b = c[2];
+        }
         sumR += r;
         sumG += g;
         sumB += b;
 
-        final l = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-        luma[idx] = l;
+        luma[idx] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
 
         final maxC = max(r, max(g, b));
         final minC = min(r, min(g, b));

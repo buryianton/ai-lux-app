@@ -1,10 +1,15 @@
 import 'package:flutter/material.dart';
 import 'screens/camera_screen.dart';
+import 'screens/photos_screen.dart';
 import 'services/inference_service.dart';
+import 'services/photo_saver.dart';
 
 void main() {
   // Initialize the ONNX runtime environment once, before the app starts.
   InferenceService.init();
+  // Background one-time repair: make previously saved dataset photos
+  // group-readable so they can be pulled over adb (see PhotoSaver).
+  PhotoSaver.makeShareable();
   runApp(const AiLuxApp());
 }
 
@@ -78,6 +83,25 @@ class PlaceholderScreen extends StatelessWidget {
                 foregroundColor: Colors.white,
                 padding: const EdgeInsets.symmetric(
                     horizontal: 32, vertical: 14),
+              ),
+            ),
+            const SizedBox(height: 12),
+            OutlinedButton.icon(
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => const PhotosScreen(),
+                  ),
+                );
+              },
+              icon: const Icon(Icons.photo_library_outlined),
+              label: const Text('Saved photos'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: const Color(0xFF1D9E75),
+                side: const BorderSide(color: Color(0xFF1D9E75)),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 32, vertical: 12),
               ),
             ),
           ],

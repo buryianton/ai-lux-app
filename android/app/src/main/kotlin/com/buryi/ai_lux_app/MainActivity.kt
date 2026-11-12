@@ -78,6 +78,8 @@ class Camera2Service(private val activity: FlutterActivity) {
     private var backgroundHandler: Handler? = null
     private var textureView: TextureView? = null
     private var pendingResult: MethodChannel.Result? = null
+    private var previewSurface: Surface? = null
+    @Volatile private var torchOn = false
 
     fun startBackgroundThread() {
         if (backgroundThread != null) return  // already running
@@ -187,6 +189,7 @@ class Camera2Service(private val activity: FlutterActivity) {
         val ps = safePreviewSize()
         st.setDefaultBufferSize(ps.width, ps.height)
         val previewSurface = Surface(st)
+        this.previewSurface = previewSurface
         try {
 
         cameraDevice!!.createCaptureSession(
@@ -248,8 +251,36 @@ class Camera2Service(private val activity: FlutterActivity) {
         // Focus: manual, infinity
         b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
         b.set(CaptureRequest.LENS_FOCUS_DISTANCE, 0.0f)
-        // Flash: off
-        b.set(CaptureRequest.FLASH_MODE, CaptureRequest.FLASH_MODE_OFF)
+        // Flash: off normally; continuous torch during a flash-pair capture.
+        // Torch (not single-shot flash) so the added illumination is the same
+        // steady source in preview and still, at the same locked exposure.
+        b.set(CaptureRequest.FLASH_MODE,
+            if (torchOn) CaptureRequest.FLASH_MODE_TORCH
+            else CaptureRequest.FLASH_MODE_OFF)
+    }
+
+    /// Torch toggle for flash-pair captures. Restarts the repeating preview
+    /// request so the torch lights immediately; the next still capture picks
+    /// the state up through applyTrainingSettings.
+    fun setTorch(on: Boolean, result: MethodChannel.Result) {
+        torchOn = on
+        val session = captureSession
+        val device = cameraDevice
+        val surface = previewSurface
+        if (session == null || device == null || surface == null) {
+            result.error("NOT_READY", "Camera not initialized", null); return
+        }
+        try {
+            val req = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                .apply {
+                    addTarget(surface)
+                    applyTrainingSettings(this)
+                }.build()
+            session.setRepeatingRequest(req, null, backgroundHandler)
+            result.success(on)
+        } catch (e: Exception) {
+            result.error("TORCH_FAILED", e.toString(), null)
+        }
     }
 
     fun captureStill(result: MethodChannel.Result) {
@@ -389,6 +420,8 @@ class MainActivity : FlutterActivity() {
                                        camera2.reopenIfNeeded()
                                        result.success(camera2.getSettingsInfo()) }
                     "capture"     -> camera2.captureStill(result)
+                    "setTorch"    -> camera2.setTorch(
+                                       call.argument<Boolean>("on") ?: false, result)
                     "getSettings" -> result.success(camera2.getSettingsInfo())
                     "deviceInfo"  -> result.success(mapOf(
                                        "manufacturer" to Build.MANUFACTURER,

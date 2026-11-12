@@ -8,11 +8,14 @@
 //     are appended together with all model outputs to measurements_log.csv
 
 import 'dart:io';
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 
 import '../services/calibration_service.dart';
 import '../services/inference_service.dart';
 import '../services/measurement_log.dart';
+import '../services/photo_saver.dart';
 
 const _green = Color(0xFF1D9E75);
 
@@ -20,12 +23,18 @@ class ResultsScreen extends StatefulWidget {
   final String imagePath;
   final String source; // 'capture' | 'upload'
   final AllModelsRun run;
+  final double heightCm; // camera height (from the height chip)
+  final String? posLabel; // flat-field frame position (POS mode), if any
+  final double? angleDeg; // measured tilt (angle-free mode), if any
 
   const ResultsScreen({
     super.key,
     required this.imagePath,
     required this.source,
     required this.run,
+    this.heightCm = 31.0,
+    this.posLabel,
+    this.angleDeg,
   });
 
   @override
@@ -38,19 +47,39 @@ class _ResultsScreenState extends State<ResultsScreen> {
   final _lampCtl = TextEditingController();
   final _surfaceCtl = TextEditingController(text: 'white_paper');
   final _noteCtl = TextEditingController();
+  final _ulCtl = TextEditingController();
+  final _urCtl = TextEditingController();
+  final _lrCtl = TextEditingController();
+  final _llCtl = TextEditingController();
   bool _saving = false;
+  bool _savingPhoto = false;
+  bool _savingReport = false;
   String? _savedPath;
+  String? _savedPhotoName;
+  String? _savedReportName;
+  final _reportKey = GlobalKey();
   String _activeLogName = MeasurementLog.defaultLog;
   Map<String, CalibrationFit> _fits = {};
+  bool _calEnabled = true;
+  String _calProfile = CalibrationService.defaultProfile;
 
   @override
   void initState() {
     super.initState();
+    // Height flows automatically into the log's note and the saved-photo
+    // filename — no more typing "47 cm" by hand (still editable).
+    _noteCtl.text = '${widget.heightCm.round()} cm';
     MeasurementLog.activeLog().then((name) {
       if (mounted) setState(() => _activeLogName = name);
     });
     CalibrationService.fitsForSource(widget.source).then((f) {
       if (mounted) setState(() => _fits = f);
+    });
+    CalibrationService.isEnabled().then((e) {
+      if (mounted) setState(() => _calEnabled = e);
+    });
+    CalibrationService.activeProfile().then((p) {
+      if (mounted) setState(() => _calProfile = p);
     });
   }
 
@@ -94,16 +123,124 @@ class _ResultsScreenState extends State<ResultsScreen> {
     _lampCtl.dispose();
     _surfaceCtl.dispose();
     _noteCtl.dispose();
+    _ulCtl.dispose();
+    _urCtl.dispose();
+    _lrCtl.dispose();
+    _llCtl.dispose();
     super.dispose();
+  }
+
+  double? _parseLux(TextEditingController ctl) {
+    final v = double.tryParse(ctl.text.replaceAll(',', '.'));
+    return (v != null && v > 0) ? v : null;
+  }
+
+  /// Snapshots the annotated photo (ROI overlay + footer) as an evidence
+  /// image into report_photos/ — the reproducibility record showing WHERE
+  /// lux was estimated and what the values were.
+  Future<void> _saveReportPhoto() async {
+    setState(() => _savingReport = true);
+    try {
+      final boundary = _reportKey.currentContext?.findRenderObject()
+          as RenderRepaintBoundary?;
+      if (boundary == null) throw Exception('overlay not ready');
+      final image = await boundary.toImage(pixelRatio: 2.0);
+      final data = await image.toByteData(format: ui.ImageByteFormat.png);
+      if (data == null) throw Exception('PNG encode failed');
+      final file = await PhotoSaver.saveReportPng(
+        data.buffer.asUint8List(),
+        luxC: _parseLux(_meterCtl),
+      );
+      if (!mounted) return;
+      final name = file.uri.pathSegments.last;
+      setState(() => _savedReportName = name);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        backgroundColor: _green,
+        content: Text('Report saved: $name',
+            style: const TextStyle(fontSize: 12)),
+      ));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        backgroundColor: Colors.red,
+        content: Text('Report save failed: $e'),
+      ));
+    } finally {
+      if (mounted) setState(() => _savingReport = false);
+    }
+  }
+
+  /// Copies the photo into dataset_photos/ under a dataset-style filename
+  /// encoding the entered lux values, surface and lamp type.
+  Future<void> _savePhotoForDataset() async {
+    final luxC = _parseLux(_meterCtl);
+    final corners = [_ulCtl, _urCtl, _lrCtl, _llCtl].map(_parseLux).toList();
+    if (luxC == null && corners.any((v) => v != null)) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+          backgroundColor: Colors.redAccent,
+          content: Text('Corner lux entered without the center value — '
+              'fill "Meter lux" (C) first')));
+      return;
+    }
+    setState(() => _savingPhoto = true);
+    try {
+      final file = await PhotoSaver.save(
+        imagePath: widget.imagePath,
+        source: widget.source,
+        luxC: luxC,
+        luxUL: corners[0],
+        luxUR: corners[1],
+        luxLR: corners[2],
+        luxLL: corners[3],
+        surface: _surfaceCtl.text,
+        lampType: _lampCtl.text,
+        note: _noteCtl.text,
+        heightCm: widget.heightCm,
+        position: widget.posLabel,
+        angleDeg: widget.angleDeg,
+      );
+      if (!mounted) return;
+      final name = file.uri.pathSegments.last;
+      setState(() => _savedPhotoName = name);
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        backgroundColor: _green,
+        content: Text('Photo saved: $name',
+            style: const TextStyle(fontSize: 12)),
+      ));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        backgroundColor: Colors.red,
+        content: Text('Photo save failed: $e'),
+      ));
+    } finally {
+      if (mounted) setState(() => _savingPhoto = false);
+    }
   }
 
   Future<void> _save() async {
     setState(() => _saving = true);
     try {
+      // Calibrated value per regressor (active profile & source), so the
+      // CSV carries BOTH raw and calibrated columns for any analyst.
+      final calibrated = <String, double>{};
+      widget.run.results.forEach((name, res) {
+        final fit = _fits[name];
+        double? raw;
+        if (name.startsWith('et_multi')) {
+          raw = res.luxByPoint?['C'];
+        } else {
+          raw = res.luxEstimate;
+        }
+        if (fit != null && raw != null) {
+          calibrated[name] = fit.apply(raw);
+        }
+      });
       final file = await MeasurementLog.append(
         imageName: widget.imagePath.split(Platform.pathSeparator).last,
         source: widget.source,
         results: widget.run.results,
+        calibrated: calibrated,
         meterLux: double.tryParse(_meterCtl.text.replaceAll(',', '.')),
         roomId: _roomCtl.text.trim(),
         lampType: _lampCtl.text.trim(),
@@ -261,6 +398,14 @@ class _ResultsScreenState extends State<ResultsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // How many of THIS run's models have a fit in the active profile —
+    // the number that actually matters for calibration of this result.
+    final relevantFits = widget.run.results.keys
+        .where((n) => _fits.containsKey(n))
+        .length;
+    final luxModels = widget.run.results.values
+        .where((r) => r.classLabel == null)
+        .length;
     // Per-ROI lux map from the multi-output model (calibrated when a fit
     // exists for it) — drawn directly on the photo overlay.
     Map<String, double>? roiLux;
@@ -313,18 +458,97 @@ class _ResultsScreenState extends State<ResultsScreen> {
       body: ListView(
         padding: const EdgeInsets.all(12),
         children: [
-          // ── Photo with ROI overlay ─────────────────────────────────────
-          ClipRRect(
-            borderRadius: BorderRadius.circular(8),
-            child: AspectRatio(
-              // reference geometry is portrait 3072x4080 = 3:4
-              aspectRatio: 3 / 4,
-              child: Stack(fit: StackFit.expand, children: [
-                Image.file(File(widget.imagePath), fit: BoxFit.cover),
-                CustomPaint(painter: _RoiOverlayPainter(
-                    roiLux: roiLux, smallArea: smallOnly)),
-              ]),
+          // ── Calibration status banner ─────────────────────────────────
+          Container(
+            margin: const EdgeInsets.only(bottom: 10),
+            padding:
+                const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFF1A1A1A),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                  color: !_calEnabled
+                      ? Colors.white38
+                      : relevantFits > 0
+                          ? _green
+                          : Colors.orangeAccent,
+                  width: 1),
             ),
+            child: Text(
+              !_calEnabled
+                  ? 'Calibration OFF — raw values shown and logged'
+                  : _fits.isEmpty
+                      ? 'Calibration ON but NO FIT for profile '
+                          '"$_calProfile" / ${widget.source} — raw values '
+                          'shown! Import or collect calibration points.'
+                      : relevantFits == 0
+                          ? 'Calibration ON but profile "$_calProfile" '
+                              'has NO FIT for the models in this run — '
+                              'raw values! Switch profile or calibrate '
+                              'these models.'
+                          : 'Calibration ON · profile "$_calProfile" · '
+                              '$relevantFits of $luxModels lux model(s) '
+                              'calibrated',
+              style: TextStyle(
+                  color: !_calEnabled
+                      ? Colors.white54
+                      : relevantFits > 0
+                          ? _green
+                          : Colors.orangeAccent,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600),
+            ),
+          ),
+          // ── Photo with ROI overlay (RepaintBoundary = report snapshot) ──
+          RepaintBoundary(
+            key: _reportKey,
+            child: Column(children: [
+              ClipRRect(
+                borderRadius: const BorderRadius.vertical(
+                    top: Radius.circular(8)),
+                child: AspectRatio(
+                  // reference geometry is portrait 3072x4080 = 3:4
+                  aspectRatio: 3 / 4,
+                  child: Stack(fit: StackFit.expand, children: [
+                    Image.file(File(widget.imagePath), fit: BoxFit.cover),
+                    CustomPaint(painter: _RoiOverlayPainter(
+                        roiLux: roiLux, smallArea: smallOnly)),
+                  ]),
+                ),
+              ),
+              // Evidence footer — burned into the report snapshot.
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 10, vertical: 6),
+                decoration: const BoxDecoration(
+                  color: Colors.black,
+                  borderRadius: BorderRadius.vertical(
+                      bottom: Radius.circular(8)),
+                ),
+                child: Builder(builder: (_) {
+                  final e = regressors.isNotEmpty ? regressors.first : null;
+                  final raw = e?.value.luxEstimate;
+                  final fit = e == null ? null : _fits[e.key.name];
+                  final cal = (fit != null && raw != null)
+                      ? fit.apply(raw)
+                      : null;
+                  final val = e == null
+                      ? ''
+                      : ' · ${e.key.displayName}: '
+                          '${(cal ?? raw)!.toStringAsFixed(0)} lx'
+                          '${cal != null ? " (cal)" : " (raw)"}';
+                  final ts = DateTime.now().toIso8601String();
+                  return Text(
+                    'AI Lux · ${InferenceService.deviceModel} · '
+                    '${ts.substring(0, 16).replaceFirst("T", " ")} · '
+                    '${widget.source}$val',
+                    style: const TextStyle(
+                        color: Colors.white70, fontSize: 9),
+                  );
+                }),
+              ),
+            ]),
           ),
           const SizedBox(height: 6),
           const Text(
@@ -378,6 +602,59 @@ class _ResultsScreenState extends State<ResultsScreen> {
           const SizedBox(height: 12),
 
           // ── Classifier results ────────────────────────────────────────
+          // ── Derived verdicts: calibrated regression vs thresholds ──
+          // On the capture path the calibrated regression is the reliable
+          // compliance signal (classifiers cannot be calibrated).
+          Builder(builder: (context) {
+            final prim = _fits['et_s8_white_paper'] != null
+                ? 'et_s8_white_paper'
+                : _fits['et_v2b_white_paper'] != null
+                    ? 'et_v2b_white_paper'
+                    : null;
+            final res = prim == null ? null : widget.run.results[prim];
+            final raw = res?.luxEstimate;
+            if (prim == null || raw == null) {
+              return const SizedBox.shrink();
+            }
+            final cal = _fits[prim]!.apply(raw);
+            Widget verdict(int thr) {
+              final above = cal >= thr;
+              return Container(
+                margin: const EdgeInsets.only(right: 8),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(
+                      color: above ? _green : Colors.redAccent),
+                ),
+                child: Text(
+                  '>=$thr lx: ${above ? "YES" : "NO"}',
+                  style: TextStyle(
+                      color: above ? _green : Colors.redAccent,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600),
+                ),
+              );
+            }
+            return Padding(
+              padding: const EdgeInsets.only(top: 4, bottom: 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                      'Compliance by calibrated measurement '
+                      '(${cal.toStringAsFixed(0)} lx)',
+                      style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600)),
+                  const SizedBox(height: 6),
+                  Row(children: [verdict(250), verdict(500)]),
+                ],
+              ),
+            );
+          }),
           const _SectionTitle('Threshold checks'),
           ...classifiers.map((e) {
             final pass = e.value.classLabel == 1;
@@ -414,6 +691,34 @@ class _ResultsScreenState extends State<ResultsScreen> {
                     keyboard: TextInputType.number)),
             const SizedBox(width: 8),
             Expanded(child: _Field(controller: _roomCtl, label: 'Room ID')),
+          ]),
+          const SizedBox(height: 8),
+          // Optional corner meter readings (5-point sessions). Order matches
+          // the dataset convention and the on-screen ROI layout.
+          Row(children: [
+            Expanded(
+                child: _Field(
+                    controller: _ulCtl,
+                    label: 'UL lux',
+                    keyboard: TextInputType.number)),
+            const SizedBox(width: 8),
+            Expanded(
+                child: _Field(
+                    controller: _urCtl,
+                    label: 'UR lux',
+                    keyboard: TextInputType.number)),
+            const SizedBox(width: 8),
+            Expanded(
+                child: _Field(
+                    controller: _lrCtl,
+                    label: 'LR lux',
+                    keyboard: TextInputType.number)),
+            const SizedBox(width: 8),
+            Expanded(
+                child: _Field(
+                    controller: _llCtl,
+                    label: 'LL lux',
+                    keyboard: TextInputType.number)),
           ]),
           const SizedBox(height: 8),
           Row(children: [
@@ -463,6 +768,61 @@ class _ResultsScreenState extends State<ResultsScreen> {
                   'Save as calibration point (${widget.source})'),
             ),
           ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 42,
+            child: OutlinedButton.icon(
+              onPressed: _savingPhoto ? null : _savePhotoForDataset,
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.lightBlueAccent,
+                side: const BorderSide(
+                    color: Colors.lightBlueAccent, width: 1),
+              ),
+              icon: _savingPhoto
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(
+                          color: Colors.lightBlueAccent, strokeWidth: 2))
+                  : const Icon(Icons.photo_library_outlined, size: 18),
+              label: const Text('Save photo for dataset'),
+            ),
+          ),
+          if (_savedPhotoName != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                  'Saved to ${PhotoSaver.folder}/$_savedPhotoName',
+                  style:
+                      const TextStyle(color: Colors.white38, fontSize: 11)),
+            ),
+          const SizedBox(height: 8),
+          SizedBox(
+            height: 42,
+            child: OutlinedButton.icon(
+              onPressed: _savingReport ? null : _saveReportPhoto,
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.white70,
+                side: const BorderSide(color: Colors.white38, width: 1),
+              ),
+              icon: _savingReport
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(
+                          color: Colors.white70, strokeWidth: 2))
+                  : const Icon(Icons.fact_check_outlined, size: 18),
+              label: const Text('Save report photo (with points)'),
+            ),
+          ),
+          if (_savedReportName != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                  'Report: ${PhotoSaver.reportFolder}/$_savedReportName',
+                  style:
+                      const TextStyle(color: Colors.white38, fontSize: 11)),
+            ),
           const SizedBox(height: 24),
         ],
       ),
